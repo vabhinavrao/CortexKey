@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "CortexKey — Streamlit App",
+			"type": "shell",
+			"command": "/Users/abhinavrao/coding/hackathon/CortexKey/.venv/bin/streamlit run /Users/abhinavrao/coding/hackathon/CortexKey/app.py --server.headless true",
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}

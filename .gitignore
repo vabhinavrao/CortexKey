@@ -1,0 +1,38 @@
+# Python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Streamlit
+.streamlit/
+
+# Data — exclude saved models/keys/passkeys (generated at runtime)
+data/models/*.pkl
+data/keys/
+data/passkeys/credentials.json
+
+# Keep directory structure
+!data/models/.gitkeep
+!data/templates/.gitkeep
+!data/passkeys/.gitkeep
+!data/keys/.gitkeep
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/settings.json
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
