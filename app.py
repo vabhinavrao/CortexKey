@@ -25,6 +25,7 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import time
 import json
+from typing import Optional
 
 from cortexkey.auth_engine import AuthEngine
 from cortexkey.passkey_manager import PasskeyManager
@@ -41,6 +42,15 @@ from cortexkey.eeg_simulator import (
     get_user_description,
     SAMPLING_RATE,
     USER_PROFILES,
+)
+from cortexkey.hardware_reader import (
+    list_serial_ports,
+    auto_detect_port,
+    connect_hardware,
+    disconnect_hardware,
+    acquire_eeg_signal,
+    get_reader,
+    SerialEEGReader,
 )
 
 
@@ -197,6 +207,12 @@ def init_session_state():
         st.session_state.auth_results = []
     if "current_page" not in st.session_state:
         st.session_state.current_page = "onboarding"
+    if "hw_reader" not in st.session_state:
+        st.session_state.hw_reader = None
+    if "hw_connected" not in st.session_state:
+        st.session_state.hw_connected = False
+    if "hw_mode" not in st.session_state:
+        st.session_state.hw_mode = False  # False = simulation, True = real hardware
 
 init_session_state()
 
@@ -476,6 +492,7 @@ def render_sidebar():
                 "📊 Signal Explorer",
                 "🔑 Passkey Manager",
                 "🌐 Google Passkey Demo",
+                "🔌 Hardware Setup",
             ],
             label_visibility="collapsed",
         )
@@ -497,7 +514,7 @@ def render_sidebar():
             <b>Classifier:</b> {'🟢 Trained' if trained else '🔴 Not trained'}<br>
             <b>CV Accuracy:</b> {accuracy:.1%}<br>
             <b>Sampling Rate:</b> {SAMPLING_RATE} Hz<br>
-            <b>Hardware:</b> BioAmp EXG Pill (Mock)
+            <b>Hardware:</b> {'🟢 Connected (Real EEG)' if st.session_state.hw_connected else '🟡 BioAmp EXG Pill (Simulated)'}
         </div>
         """, unsafe_allow_html=True)
 
@@ -536,6 +553,12 @@ def render_sidebar():
             st.session_state.passkey_manager.reset()
             st.session_state.enrolled_users = set()
             st.session_state.auth_results = []
+            # Disconnect hardware on reset
+            if st.session_state.hw_reader is not None:
+                st.session_state.hw_reader.stop()
+                st.session_state.hw_reader = None
+                st.session_state.hw_connected = False
+                st.session_state.hw_mode = False
             st.rerun()
 
     return page
@@ -1420,6 +1443,363 @@ def page_google_demo():
 
 
 # ─────────────────────────────────────────────────────────
+# PAGE: HARDWARE SETUP
+# ─────────────────────────────────────────────────────────
+
+def page_hardware_setup():
+    """Real hardware connection and live streaming page."""
+    st.markdown("""
+    <div class="cortexkey-header">
+        <h1>🔌 Hardware Setup</h1>
+        <p>Connect the BioAmp EXG Pill + ESP32 for real brainwave authentication</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── WIRING DIAGRAM ──────────────────────────────────────────────────────
+    with st.expander("📐 Wiring & Electrode Setup", expanded=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("#### ESP32 Wiring")
+            st.code("""
+BioAmp EXG Pill     →    ESP32 DevKit
+───────────────          ────────────
+OUT  (yellow wire)  →    GPIO 34  (ADC input)
+GND  (black wire)   →    GND
+VCC  (red wire)     →    3.3V
+
+⚠️  Use GPIO 34 (ADC1 channel) — NOT GPIO 36/39
+    ADC2 pins conflict with WiFi — stick to ADC1.
+    """, language="text")
+
+        with col2:
+            st.markdown("#### Arduino Uno / Nano Wiring")
+            st.code("""
+BioAmp EXG Pill     →    Arduino Uno / Nano
+───────────────          ──────────────────
+OUT  (yellow wire)  →    A0
+GND  (black wire)   →    GND
+VCC  (red wire)     →    5V  (NOT 3.3V for Uno!)
+
+💡  ESP32 recommended: 12-bit ADC vs 10-bit
+    gives significantly better signal resolution.
+    """, language="text")
+
+        st.markdown("#### Electrode Placement (EEG — Frontal Lobe)")
+        st.markdown("""
+        | Pad | Location | How to attach |
+        |-----|----------|---------------|
+        | **REF** (reference) | Mastoid bone (bony bump behind ear) OR earlobe | Disposable snap electrode or alligator clip |
+        | **SIG** (signal) | Fp1 or Fp2 — forehead, ~2 cm above eyebrow | Disposable snap electrode with conductive gel |
+        | **GND** (ground) | Opposite side of forehead or chin | Disposable snap electrode |
+
+        > **Tip:** Clean skin with isopropyl alcohol before attaching electrodes for lower impedance.
+        > Blink twice deliberately at the start — you'll see the ~150 μV artifact in the signal, confirming the electrodes are picking up signal.
+        """)
+
+    st.markdown("---")
+
+    # ── FIRMWARE ────────────────────────────────────────────────────────────
+    with st.expander("💾 Flash Firmware to ESP32/Arduino"):
+        st.markdown("""
+        ### Step-by-Step: Upload Firmware
+
+        **Prerequisites:**
+        - [Arduino IDE 2.x](https://www.arduino.cc/en/software) (free)
+        - For ESP32: install board package via  
+          `File → Preferences → Additional Board URLs`:  
+          `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
+        - Then: `Tools → Board Manager → Search "esp32" → Install`
+
+        **Upload Steps:**
+        1. Open `firmware/bioamp_serial/bioamp_serial.ino` in Arduino IDE
+        2. Select your board: `Tools → Board → ESP32 Dev Module` (or your Arduino)
+        3. Select port: `Tools → Port → /dev/ttyUSB0` (Linux/Mac) or `COM3` (Windows)
+        4. **Verify the `#define BOARD_ESP32` line matches your board**
+        5. Click **Upload** (→ icon)
+        6. Open Serial Monitor at 115200 baud — you should see integers streaming
+
+        **Expected Serial Monitor output:**
+        ```
+        # CortexKey EEG Firmware v1.0
+        # Board: ESP32 (12-bit, 3.3V)
+        # Sample rate: 250 Hz
+        # --- DATA START ---
+        2048
+        2053
+        2041
+        2061
+        ...
+        ```
+        """)
+
+        # Show firmware content
+        st.markdown("**Firmware source** (`firmware/bioamp_serial/bioamp_serial.ino`):")
+        try:
+            import os
+            fw_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "firmware", "bioamp_serial", "bioamp_serial.ino"
+            )
+            with open(fw_path) as f:
+                fw_content = f.read()
+            st.code(fw_content[:3000] + "\n... (see file for full source)", language="cpp")
+        except Exception:
+            st.info("Firmware file at `firmware/bioamp_serial/bioamp_serial.ino`")
+
+    st.markdown("---")
+
+    # ── CONNECTION PANEL ────────────────────────────────────────────────────
+    st.markdown("### 🔌 Connect Hardware")
+
+    col1, col2, col3 = st.columns([2, 1, 1])
+
+    with col1:
+        # Port selection
+        ports = list_serial_ports()
+        port_options = ["Auto-detect"] + [
+            f"{p['port']} — {p['description']}" for p in ports
+        ]
+        selected_port_label = st.selectbox(
+            "Serial Port",
+            port_options,
+            help="Select the port your ESP32/Arduino is connected to",
+        )
+        if selected_port_label == "Auto-detect":
+            selected_port = None
+        else:
+            selected_port = selected_port_label.split(" — ")[0]
+
+    with col2:
+        board_choice = st.selectbox(
+            "Board",
+            ["esp32", "arduino"],
+            help="ESP32 = 12-bit ADC (better quality). Arduino = 10-bit ADC.",
+        )
+
+    with col3:
+        baud_choice = st.selectbox(
+            "Baud Rate",
+            [115200, 9600, 57600],
+            help="Must match the BAUD_RATE in the firmware",
+        )
+
+    col_btn1, col_btn2, col_btn3 = st.columns(3)
+
+    with col_btn1:
+        if st.button("🔌 Connect", use_container_width=True, type="primary",
+                     disabled=st.session_state.hw_connected):
+            with st.spinner("Connecting to hardware..."):
+                success, msg, reader = connect_hardware(
+                    port=selected_port,
+                    board=board_choice,
+                    baud=baud_choice,
+                )
+            if success:
+                st.session_state.hw_reader = reader
+                st.session_state.hw_connected = True
+                st.session_state.hw_mode = True
+                st.success(f"✅ {msg}")
+                st.rerun()
+            else:
+                st.error(f"❌ {msg}")
+                st.info("💡 Make sure the firmware is uploaded and the USB cable is connected.")
+
+    with col_btn2:
+        if st.button("🔴 Disconnect", use_container_width=True,
+                     disabled=not st.session_state.hw_connected):
+            disconnect_hardware()
+            st.session_state.hw_reader = None
+            st.session_state.hw_connected = False
+            st.session_state.hw_mode = False
+            st.rerun()
+
+    with col_btn3:
+        if st.button("🔄 Refresh Ports", use_container_width=True):
+            st.rerun()
+
+    # ── CONNECTION STATUS ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Status")
+
+    reader: SerialEEGReader = st.session_state.hw_reader
+
+    if st.session_state.hw_connected and reader is not None:
+        if reader.is_connected:
+            stats = reader.get_stats()
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h3>Connection</h3>
+                    <div class="value" style="color:#00ff41">🟢 Live</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col2:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h3>Effective Fs</h3>
+                    <div class="value">{stats['effective_fs']:.0f} Hz</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col3:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h3>Buffered</h3>
+                    <div class="value">{stats['seconds_buffered']:.1f}s</div>
+                </div>
+                """, unsafe_allow_html=True)
+            with col4:
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h3>Samples Read</h3>
+                    <div class="value">{stats['samples_read']:,}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+            # ── LIVE SIGNAL PREVIEW ──────────────────────────────────────────
+            st.markdown("---")
+            st.markdown("### 📡 Live EEG Preview")
+            st.info("👉 The entire app now uses **real EEG** from the hardware. "
+                    "Go to **Onboarding** or **Authentication** — they will automatically "
+                    "use the hardware reader instead of the simulator.")
+
+            if st.button("📊 Capture & Display Live Signal", use_container_width=True):
+                with st.spinner("Waiting for 4 seconds of EEG data..."):
+                    result = acquire_eeg_signal(reader, duration_sec=4.0, wait_timeout=12.0)
+
+                if result is None:
+                    st.error("❌ Could not acquire signal. Buffer may not have enough data yet. Wait a few seconds and try again.")
+                else:
+                    t, raw_signal = result
+
+                    # Process through the same DSP pipeline
+                    processed = full_preprocessing_pipeline(raw_signal, fs=SAMPLING_RATE)
+                    freqs, psd = compute_psd(processed["narrow_bandpass"], fs=SAMPLING_RATE)
+                    bp = extract_band_powers(freqs, psd)
+
+                    signals_dict = {
+                        "raw": raw_signal,
+                        "notch_filtered": processed["notch_filtered"],
+                        "bandpass_filtered": processed["narrow_bandpass"],
+                    }
+
+                    fig = create_eeg_signal_plot(
+                        t, signals_dict, "Live EEG — BioAmp EXG Pill"
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        fig_psd = create_psd_plot(freqs, psd, bp, "Real-Time Neural Signature")
+                        st.plotly_chart(fig_psd, use_container_width=True)
+                    with col2:
+                        fig_bp = create_band_power_chart(bp, "Band Powers (Live)")
+                        st.plotly_chart(fig_bp, use_container_width=True)
+
+                    st.success("✅ Signal captured successfully. Electrode contact is good!")
+
+        else:
+            st.warning("⚠️ Hardware was connected but the serial link dropped.")
+            err = reader.get_error()
+            if err:
+                st.error(f"Error: {err}")
+            st.session_state.hw_connected = False
+            st.session_state.hw_mode = False
+
+    else:
+        # Not connected
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <h3>Connection</h3>
+                <div class="value" style="color:#ffd93d">🟡 Simulation</div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            st.info("No hardware connected — all pages use **simulated EEG**. "
+                    "Connect the BioAmp EXG Pill above to switch to real data.")
+
+        st.markdown("---")
+        st.markdown("### 🔎 Detected Serial Ports")
+        if ports:
+            for p in ports:
+                st.markdown(f"- `{p['port']}` — {p['description']} (`{p['hwid']}`)")
+        else:
+            st.warning("No serial ports found. Connect your ESP32/Arduino via USB.")
+
+    # ── HARDWARE INTEGRATION MODE IN AUTH ENGINE ──────────────────────────
+    st.markdown("---")
+    with st.expander("🛠️ How Hardware Mode Works"):
+        st.markdown("""
+        ### Seamless Simulation → Hardware Switch
+
+        The entire CortexKey processing pipeline (DSP, SVM, passkeys) is **hardware-agnostic**.
+        The only difference when real hardware is connected is where the raw numpy array comes from:
+
+        ```
+        SIMULATION MODE:          HARDWARE MODE:
+        ─────────────────         ─────────────────────────────
+        eeg_simulator             BioAmp EXG Pill
+            │                         │
+            ▼                         ▼
+        numpy array              ESP32 ADC samples (12-bit)
+        (microvolts)                  │
+                                      ▼ adc_to_microvolts()
+                                  numpy array
+                                  (microvolts)
+                                  
+        ─────────────────────────────────────────────────────
+        SAME PIPELINE (signal_processing → classifier → auth):
+        
+        numpy array (μV)
+            │
+            ▼ apply_notch_filter(50 Hz)
+            ▼ apply_bandpass_filter(5-30 Hz)
+            ▼ compute_psd (Welch)
+            ▼ extract_band_powers
+            ▼ extract_features (13-dim vector)
+            ▼ SVM classifier
+            ▼ Auth decision
+        ```
+
+        When you connect hardware:
+        - **Onboarding** records real trials from the hardware instead of simulating them
+        - **Authentication** captures a live window and classifies it in real time
+        - All visualizations (EEG signal, PSD, band powers) show real data
+        - The passkey flow remains identical
+
+        The `SerialEEGReader` runs in a background thread with a 30-second ring buffer,
+        so the UI never blocks waiting for serial data.
+        """)
+
+
+# ─────────────────────────────────────────────────────────
+# HARDWARE-AWARE HELPERS (used by Onboarding & Auth pages)
+# ─────────────────────────────────────────────────────────
+
+def _acquire_eeg(user_id: str, seed: Optional[int] = None):
+    """
+    Unified EEG acquisition: uses hardware if connected, simulator otherwise.
+
+    Returns (t, raw_signal, meta) — same shape as generate_eeg_signal().
+    """
+    reader = st.session_state.get("hw_reader")
+    hw_connected = st.session_state.get("hw_connected", False)
+
+    if hw_connected and reader is not None and reader.is_connected:
+        result = acquire_eeg_signal(reader, duration_sec=4.0, wait_timeout=8.0)
+        if result is not None:
+            t, raw_signal = result
+            meta = {"source": "hardware", "user_id": user_id}
+            return t, raw_signal, meta
+        # Fall through to simulator on failure
+
+    # Fallback: simulator
+    return generate_eeg_signal(user_id=user_id, seed=seed)
+
+
+# ─────────────────────────────────────────────────────────
 # MAIN APP
 # ─────────────────────────────────────────────────────────
 
@@ -1436,6 +1816,8 @@ def main():
         page_passkey_manager()
     elif "Google" in page:
         page_google_demo()
+    elif "Hardware" in page:
+        page_hardware_setup()
 
 
 if __name__ == "__main__":
