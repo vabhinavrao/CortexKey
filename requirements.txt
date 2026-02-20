@@ -9,3 +9,4 @@ hashlib-additional>=1.0.1; python_version < "3.0"
 pandas>=2.0.0
 watchdog>=3.0.0
 pyserial>=3.5
+bleak>=0.21.0

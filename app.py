@@ -52,6 +52,12 @@ from cortexkey.hardware_reader import (
     get_reader,
     SerialEEGReader,
 )
+from cortexkey.ble_reader import (
+    BLEEEGReader,
+    scan_ble_devices,
+    is_ble_available,
+    PROFILE_NAMES as BLE_PROFILE_NAMES,
+)
 
 
 # ─────────────────────────────────────────────────────────
@@ -213,6 +219,10 @@ def init_session_state():
         st.session_state.hw_connected = False
     if "hw_mode" not in st.session_state:
         st.session_state.hw_mode = False  # False = simulation, True = real hardware
+    if "ble_reader" not in st.session_state:
+        st.session_state.ble_reader = None
+    if "ble_connected" not in st.session_state:
+        st.session_state.ble_connected = False
 
 init_session_state()
 
@@ -508,13 +518,21 @@ def render_sidebar():
         trained = status["classifier_trained"]
         accuracy = status.get("classifier_accuracy") or 0
 
+        # Determine hardware status display string
+        if st.session_state.ble_connected:
+            hw_status = '🟢 Connected (BLE Wireless)'
+        elif st.session_state.hw_connected:
+            hw_status = '🟢 Connected (USB Serial)'
+        else:
+            hw_status = '🟡 BioAmp EXG Pill (Simulated)'
+
         st.markdown(f"""
         <div class="sidebar-info">
             <b>Enrolled Users:</b> {enrolled}<br>
             <b>Classifier:</b> {'🟢 Trained' if trained else '🔴 Not trained'}<br>
             <b>CV Accuracy:</b> {accuracy:.1%}<br>
             <b>Sampling Rate:</b> {SAMPLING_RATE} Hz<br>
-            <b>Hardware:</b> {'🟢 Connected (Real EEG)' if st.session_state.hw_connected else '🟡 BioAmp EXG Pill (Simulated)'}
+            <b>Hardware:</b> {hw_status}
         </div>
         """, unsafe_allow_html=True)
 
@@ -559,6 +577,11 @@ def render_sidebar():
                 st.session_state.hw_reader = None
                 st.session_state.hw_connected = False
                 st.session_state.hw_mode = False
+            # Disconnect BLE on reset
+            if st.session_state.ble_reader is not None:
+                st.session_state.ble_reader.disconnect()
+                st.session_state.ble_reader = None
+                st.session_state.ble_connected = False
             st.rerun()
 
     return page
@@ -1447,16 +1470,16 @@ def page_google_demo():
 # ─────────────────────────────────────────────────────────
 
 def page_hardware_setup():
-    """Real hardware connection and live streaming page."""
+    """Real hardware connection and live streaming page — USB Serial + BLE."""
     st.markdown("""
     <div class="cortexkey-header">
         <h1>🔌 Hardware Setup</h1>
-        <p>Connect the BioAmp EXG Pill + ESP32 for real brainwave authentication</p>
+        <p>Connect the BioAmp EXG Pill + ESP32 — via USB or Bluetooth</p>
     </div>
     """, unsafe_allow_html=True)
 
-    # ── WIRING DIAGRAM ──────────────────────────────────────────────────────
-    with st.expander("📐 Wiring & Electrode Setup", expanded=True):
+    # ── WIRING & FIRMWARE (collapsed by default) ────────────────────────────
+    with st.expander("📐 Wiring & Electrode Setup"):
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### ESP32 Wiring")
@@ -1470,7 +1493,6 @@ VCC  (red wire)     →    3.3V
 ⚠️  Use GPIO 34 (ADC1 channel) — NOT GPIO 36/39
     ADC2 pins conflict with WiFi — stick to ADC1.
     """, language="text")
-
         with col2:
             st.markdown("#### Arduino Uno / Nano Wiring")
             st.code("""
@@ -1479,299 +1501,373 @@ BioAmp EXG Pill     →    Arduino Uno / Nano
 OUT  (yellow wire)  →    A0
 GND  (black wire)   →    GND
 VCC  (red wire)     →    5V  (NOT 3.3V for Uno!)
-
-💡  ESP32 recommended: 12-bit ADC vs 10-bit
-    gives significantly better signal resolution.
     """, language="text")
-
         st.markdown("#### Electrode Placement (EEG — Frontal Lobe)")
         st.markdown("""
         | Pad | Location | How to attach |
         |-----|----------|---------------|
-        | **REF** (reference) | Mastoid bone (bony bump behind ear) OR earlobe | Disposable snap electrode or alligator clip |
-        | **SIG** (signal) | Fp1 or Fp2 — forehead, ~2 cm above eyebrow | Disposable snap electrode with conductive gel |
-        | **GND** (ground) | Opposite side of forehead or chin | Disposable snap electrode |
-
-        > **Tip:** Clean skin with isopropyl alcohol before attaching electrodes for lower impedance.
-        > Blink twice deliberately at the start — you'll see the ~150 μV artifact in the signal, confirming the electrodes are picking up signal.
+        | **REF** (reference) | Mastoid bone (behind ear) OR earlobe | Snap electrode or clip |
+        | **SIG** (signal) | Fp1 or Fp2 — forehead, ~2 cm above eyebrow | Snap electrode with gel |
+        | **GND** (ground) | Opposite forehead or chin | Snap electrode |
         """)
 
-    st.markdown("---")
-
-    # ── FIRMWARE ────────────────────────────────────────────────────────────
-    with st.expander("💾 Flash Firmware to ESP32/Arduino"):
+    with st.expander("💾 Flash Firmware to ESP32"):
         st.markdown("""
-        ### Step-by-Step: Upload Firmware
+        ### Two firmware options:
 
-        **Prerequisites:**
-        - [Arduino IDE 2.x](https://www.arduino.cc/en/software) (free)
-        - For ESP32: install board package via  
-          `File → Preferences → Additional Board URLs`:  
-          `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-        - Then: `Tools → Board Manager → Search "esp32" → Install`
+        | Firmware | File | Transport | Use case |
+        |----------|------|-----------|----------|
+        | **USB Serial** | `firmware/bioamp_serial/bioamp_serial.ino` | USB cable | Lowest latency, no pairing needed |
+        | **BLE Mock** | `firmware/bioamp_ble_mock/bioamp_ble_mock.ino` | Bluetooth | Wireless demo, mock EEG on-chip |
 
-        **Upload Steps:**
-        1. Open `firmware/bioamp_serial/bioamp_serial.ino` in Arduino IDE
-        2. Select your board: `Tools → Board → ESP32 Dev Module` (or your Arduino)
-        3. Select port: `Tools → Port → /dev/ttyUSB0` (Linux/Mac) or `COM3` (Windows)
-        4. **Verify the `#define BOARD_ESP32` line matches your board**
+        **Upload steps (both):**
+        1. Open the `.ino` file in Arduino IDE 2.x
+        2. Install ESP32 board package (Board Manager → search "esp32")
+        3. `Tools → Board → ESP32 Dev Module`
+        4. `Tools → Port` → select your port
         5. Click **Upload** (→ icon)
-        6. Open Serial Monitor at 115200 baud — you should see integers streaming
-
-        **Expected Serial Monitor output:**
-        ```
-        # CortexKey EEG Firmware v1.0
-        # Board: ESP32 (12-bit, 3.3V)
-        # Sample rate: 250 Hz
-        # --- DATA START ---
-        2048
-        2053
-        2041
-        2061
-        ...
-        ```
+        6. For BLE: open Serial Monitor at 115200 — you'll see `# BLE advertising started`
         """)
 
-        # Show firmware content
-        st.markdown("**Firmware source** (`firmware/bioamp_serial/bioamp_serial.ino`):")
-        try:
-            import os
-            fw_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                "firmware", "bioamp_serial", "bioamp_serial.ino"
-            )
-            with open(fw_path) as f:
-                fw_content = f.read()
-            st.code(fw_content[:3000] + "\n... (see file for full source)", language="cpp")
-        except Exception:
-            st.info("Firmware file at `firmware/bioamp_serial/bioamp_serial.ino`")
-
     st.markdown("---")
 
-    # ── CONNECTION PANEL ────────────────────────────────────────────────────
-    st.markdown("### 🔌 Connect Hardware")
+    # ═══════════════════════════════════════════════════════════════════════
+    # CONNECTION TABS — USB Serial vs BLE Wireless
+    # ═══════════════════════════════════════════════════════════════════════
 
-    col1, col2, col3 = st.columns([2, 1, 1])
+    tab_usb, tab_ble = st.tabs(["🔌 USB Serial", "📡 Bluetooth (BLE)"])
 
-    with col1:
-        # Port selection
-        ports = list_serial_ports()
-        port_options = ["Auto-detect"] + [
-            f"{p['port']} — {p['description']}" for p in ports
-        ]
-        selected_port_label = st.selectbox(
-            "Serial Port",
-            port_options,
-            help="Select the port your ESP32/Arduino is connected to",
-        )
-        if selected_port_label == "Auto-detect":
-            selected_port = None
-        else:
-            selected_port = selected_port_label.split(" — ")[0]
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 1: USB SERIAL (existing functionality)
+    # ─────────────────────────────────────────────────────────────────────
+    with tab_usb:
+        st.markdown("### USB Serial Connection")
+        st.caption("Connect via USB cable — best for real EEG with the BioAmp EXG Pill")
 
-    with col2:
-        board_choice = st.selectbox(
-            "Board",
-            ["esp32", "arduino"],
-            help="ESP32 = 12-bit ADC (better quality). Arduino = 10-bit ADC.",
-        )
-
-    with col3:
-        baud_choice = st.selectbox(
-            "Baud Rate",
-            [115200, 9600, 57600],
-            help="Must match the BAUD_RATE in the firmware",
-        )
-
-    col_btn1, col_btn2, col_btn3 = st.columns(3)
-
-    with col_btn1:
-        if st.button("🔌 Connect", use_container_width=True, type="primary",
-                     disabled=st.session_state.hw_connected):
-            with st.spinner("Connecting to hardware..."):
-                success, msg, reader = connect_hardware(
-                    port=selected_port,
-                    board=board_choice,
-                    baud=baud_choice,
-                )
-            if success:
-                st.session_state.hw_reader = reader
-                st.session_state.hw_connected = True
-                st.session_state.hw_mode = True
-                st.success(f"✅ {msg}")
-                st.rerun()
-            else:
-                st.error(f"❌ {msg}")
-                st.info("💡 Make sure the firmware is uploaded and the USB cable is connected.")
-
-    with col_btn2:
-        if st.button("🔴 Disconnect", use_container_width=True,
-                     disabled=not st.session_state.hw_connected):
-            disconnect_hardware()
-            st.session_state.hw_reader = None
-            st.session_state.hw_connected = False
-            st.session_state.hw_mode = False
-            st.rerun()
-
-    with col_btn3:
-        if st.button("🔄 Refresh Ports", use_container_width=True):
-            st.rerun()
-
-    # ── CONNECTION STATUS ────────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### Status")
-
-    reader: SerialEEGReader = st.session_state.hw_reader
-
-    if st.session_state.hw_connected and reader is not None:
-        if reader.is_connected:
-            stats = reader.get_stats()
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>Connection</h3>
-                    <div class="value" style="color:#00ff41">🟢 Live</div>
-                </div>
-                """, unsafe_allow_html=True)
-            with col2:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>Effective Fs</h3>
-                    <div class="value">{stats['effective_fs']:.0f} Hz</div>
-                </div>
-                """, unsafe_allow_html=True)
-            with col3:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>Buffered</h3>
-                    <div class="value">{stats['seconds_buffered']:.1f}s</div>
-                </div>
-                """, unsafe_allow_html=True)
-            with col4:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>Samples Read</h3>
-                    <div class="value">{stats['samples_read']:,}</div>
-                </div>
-                """, unsafe_allow_html=True)
-
-            # ── LIVE SIGNAL PREVIEW ──────────────────────────────────────────
-            st.markdown("---")
-            st.markdown("### 📡 Live EEG Preview")
-            st.info("👉 The entire app now uses **real EEG** from the hardware. "
-                    "Go to **Onboarding** or **Authentication** — they will automatically "
-                    "use the hardware reader instead of the simulator.")
-
-            if st.button("📊 Capture & Display Live Signal", use_container_width=True):
-                with st.spinner("Waiting for 4 seconds of EEG data..."):
-                    result = acquire_eeg_signal(reader, duration_sec=4.0, wait_timeout=12.0)
-
-                if result is None:
-                    st.error("❌ Could not acquire signal. Buffer may not have enough data yet. Wait a few seconds and try again.")
-                else:
-                    t, raw_signal = result
-
-                    # Process through the same DSP pipeline
-                    processed = full_preprocessing_pipeline(raw_signal, fs=SAMPLING_RATE)
-                    freqs, psd = compute_psd(processed["narrow_bandpass"], fs=SAMPLING_RATE)
-                    bp = extract_band_powers(freqs, psd)
-
-                    signals_dict = {
-                        "raw": raw_signal,
-                        "notch_filtered": processed["notch_filtered"],
-                        "bandpass_filtered": processed["narrow_bandpass"],
-                    }
-
-                    fig = create_eeg_signal_plot(
-                        t, signals_dict, "Live EEG — BioAmp EXG Pill"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        fig_psd = create_psd_plot(freqs, psd, bp, "Real-Time Neural Signature")
-                        st.plotly_chart(fig_psd, use_container_width=True)
-                    with col2:
-                        fig_bp = create_band_power_chart(bp, "Band Powers (Live)")
-                        st.plotly_chart(fig_bp, use_container_width=True)
-
-                    st.success("✅ Signal captured successfully. Electrode contact is good!")
-
-        else:
-            st.warning("⚠️ Hardware was connected but the serial link dropped.")
-            err = reader.get_error()
-            if err:
-                st.error(f"Error: {err}")
-            st.session_state.hw_connected = False
-            st.session_state.hw_mode = False
-
-    else:
-        # Not connected
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns([2, 1, 1])
         with col1:
-            st.markdown(f"""
+            ports = list_serial_ports()
+            port_options = ["Auto-detect"] + [
+                f"{p['port']} — {p['description']}" for p in ports
+            ]
+            selected_port_label = st.selectbox(
+                "Serial Port", port_options,
+                help="Select the port your ESP32/Arduino is connected to",
+            )
+            selected_port = None if selected_port_label == "Auto-detect" else selected_port_label.split(" — ")[0]
+        with col2:
+            board_choice = st.selectbox("Board", ["esp32", "arduino"])
+        with col3:
+            baud_choice = st.selectbox("Baud Rate", [115200, 9600, 57600])
+
+        col_b1, col_b2, col_b3 = st.columns(3)
+        with col_b1:
+            if st.button("🔌 Connect USB", use_container_width=True, type="primary",
+                         disabled=st.session_state.hw_connected):
+                with st.spinner("Connecting to hardware..."):
+                    success, msg, reader = connect_hardware(port=selected_port, board=board_choice, baud=baud_choice)
+                if success:
+                    st.session_state.hw_reader = reader
+                    st.session_state.hw_connected = True
+                    st.session_state.hw_mode = True
+                    st.success(f"✅ {msg}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ {msg}")
+        with col_b2:
+            if st.button("🔴 Disconnect USB", use_container_width=True,
+                         disabled=not st.session_state.hw_connected):
+                disconnect_hardware()
+                st.session_state.hw_reader = None
+                st.session_state.hw_connected = False
+                st.session_state.hw_mode = False
+                st.rerun()
+        with col_b3:
+            if st.button("🔄 Refresh Ports", use_container_width=True):
+                st.rerun()
+
+        # USB Status & preview
+        if st.session_state.hw_connected and st.session_state.hw_reader is not None:
+            reader = st.session_state.hw_reader
+            if reader.is_connected:
+                stats = reader.get_stats()
+                _render_connection_status(stats, "USB Serial")
+                _render_live_preview_button(reader, "usb")
+            else:
+                st.warning("⚠️ USB serial link dropped.")
+                st.session_state.hw_connected = False
+                st.session_state.hw_mode = False
+        else:
+            st.info("No USB serial device connected. Plug in your ESP32/Arduino via USB.")
+            if ports:
+                st.markdown("**Detected ports:**")
+                for p in ports:
+                    st.markdown(f"- `{p['port']}` — {p['description']}")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # TAB 2: BLE WIRELESS
+    # ─────────────────────────────────────────────────────────────────────
+    with tab_ble:
+        st.markdown("### 📡 Bluetooth Low Energy (BLE) Connection")
+        st.caption("Connect wirelessly — flash `bioamp_ble_mock.ino` to your ESP32 for a wireless mock EEG demo")
+
+        if not is_ble_available():
+            st.error("❌ `bleak` library not found. Install it with: `pip install bleak`")
+            return
+
+        # ── Scan for BLE devices ────────────────────────────────────────────
+        col1, col2 = st.columns([3, 1])
+        with col2:
+            scan_btn = st.button("🔍 Scan for BLE Devices", use_container_width=True)
+
+        # Store scan results in session state so they persist across reruns
+        if "ble_scan_results" not in st.session_state:
+            st.session_state.ble_scan_results = []
+
+        if scan_btn:
+            with st.spinner("📡 Scanning for Bluetooth devices (5 seconds)..."):
+                devices = scan_ble_devices(timeout=5.0)
+                st.session_state.ble_scan_results = devices
+
+        devices = st.session_state.ble_scan_results
+
+        with col1:
+            if devices:
+                # Build selection list — CortexKey devices highlighted
+                device_options = []
+                for d in devices:
+                    prefix = "🧠 " if d["is_cortexkey"] else "   "
+                    device_options.append(
+                        f"{prefix}{d['name']} — {d['address']} (RSSI: {d['rssi']} dBm)"
+                    )
+                selected_device_label = st.selectbox(
+                    "Select BLE Device",
+                    device_options,
+                    help="🧠 = CortexKey-EEG device detected",
+                )
+                # Extract address from label
+                selected_address = devices[device_options.index(selected_device_label)]["address"]
+            else:
+                st.info("No devices found yet. Click **Scan** to search for nearby Bluetooth devices.")
+                selected_address = None
+
+        # ── Connect / Disconnect BLE ────────────────────────────────────────
+        col_b1, col_b2 = st.columns(2)
+        with col_b1:
+            connect_disabled = st.session_state.ble_connected or selected_address is None
+            if st.button("� Connect BLE", use_container_width=True, type="primary",
+                         disabled=connect_disabled):
+                with st.spinner(f"🔗 Connecting to {selected_address} via BLE..."):
+                    ble_reader = BLEEEGReader()
+                    success = ble_reader.connect(address=selected_address, timeout=15.0)
+
+                if success:
+                    st.session_state.ble_reader = ble_reader
+                    st.session_state.ble_connected = True
+                    st.session_state.hw_mode = True
+                    st.success(f"✅ Connected to CortexKey-EEG via BLE!")
+                    st.rerun()
+                else:
+                    err = ble_reader.get_error() or "Connection failed"
+                    st.error(f"❌ {err}")
+                    st.info("💡 Make sure the ESP32 is powered on and running `bioamp_ble_mock.ino`")
+
+        with col_b2:
+            if st.button("🔴 Disconnect BLE", use_container_width=True,
+                         disabled=not st.session_state.ble_connected):
+                if st.session_state.ble_reader is not None:
+                    st.session_state.ble_reader.disconnect()
+                st.session_state.ble_reader = None
+                st.session_state.ble_connected = False
+                if not st.session_state.hw_connected:
+                    st.session_state.hw_mode = False
+                st.rerun()
+
+        # ── BLE Status & Live Preview ───────────────────────────────────────
+        st.markdown("---")
+
+        ble_reader: BLEEEGReader = st.session_state.ble_reader
+
+        if st.session_state.ble_connected and ble_reader is not None and ble_reader.is_connected:
+            stats = ble_reader.get_stats()
+            _render_connection_status(stats, "BLE Wireless")
+
+            # ── Profile switcher (BLE exclusive feature!) ───────────────────
+            st.markdown("---")
+            st.markdown("### 🧑‍🔬 Remote Profile Switcher")
+            st.caption(
+                "Switch the mock EEG user profile **on the ESP32 chip** over Bluetooth — "
+                "the waveform changes in real time without re-flashing!"
+            )
+
+            col1, col2 = st.columns([2, 1])
+            with col1:
+                profile_labels = [
+                    "0 — 🧠 Devesh (strong alpha, team lead)",
+                    "1 — 💻 Abhinav (high beta, analytical)",
+                    "2 — 🎨 Sadaf (strong theta, emotional)",
+                    "3 — 🕵️ Impostor (unknown person)",
+                    "4 — 😰 Devesh Coerced (under stress)",
+                ]
+                selected_profile_label = st.selectbox(
+                    "ESP32 Mock Profile",
+                    profile_labels,
+                    index=BLE_PROFILE_NAMES.index(ble_reader.current_profile_name)
+                        if ble_reader.current_profile_name in BLE_PROFILE_NAMES else 0,
+                )
+                selected_profile_idx = int(selected_profile_label.split(" — ")[0])
+
+            with col2:
+                if st.button("🔄 Switch Profile on ESP32", use_container_width=True, type="primary"):
+                    with st.spinner("Sending profile switch command via BLE..."):
+                        ok = ble_reader.set_profile(selected_profile_idx)
+                        time.sleep(0.5)
+                    if ok:
+                        # Clear the buffer so old profile data doesn't mix
+                        ble_reader.clear_buffer()
+                        st.success(f"✅ ESP32 now generating: **{BLE_PROFILE_NAMES[selected_profile_idx]}**")
+                    else:
+                        st.error("❌ Failed to switch profile")
+
+            # ── Live signal preview ──────────────────────────────────────────
+            _render_live_preview_button(ble_reader, "ble")
+
+        elif st.session_state.ble_connected:
+            st.warning("⚠️ BLE connection was lost.")
+            st.session_state.ble_connected = False
+            if not st.session_state.hw_connected:
+                st.session_state.hw_mode = False
+        else:
+            st.markdown("""
             <div class="metric-card">
-                <h3>Connection</h3>
-                <div class="value" style="color:#ffd93d">🟡 Simulation</div>
+                <h3>BLE Status</h3>
+                <div class="value" style="color:#ffd93d">🟡 Not Connected</div>
             </div>
             """, unsafe_allow_html=True)
-        with col2:
-            st.info("No hardware connected — all pages use **simulated EEG**. "
-                    "Connect the BioAmp EXG Pill above to switch to real data.")
+            st.markdown("")
+            st.markdown("""
+            **Quick start:**
+            1. Flash `firmware/bioamp_ble_mock/bioamp_ble_mock.ino` to your ESP32
+            2. The ESP32 LED will blink 3× then start blinking every second (advertising)
+            3. Click **Scan** above → select **CortexKey-EEG** → click **Connect BLE**
+            4. The LED goes solid = connected. Samples stream at 250 Hz wirelessly.
+            5. Use the **Profile Switcher** to change mock users from this UI!
+            """)
 
-        st.markdown("---")
-        st.markdown("### 🔎 Detected Serial Ports")
-        if ports:
-            for p in ports:
-                st.markdown(f"- `{p['port']}` — {p['description']} (`{p['hwid']}`)")
-        else:
-            st.warning("No serial ports found. Connect your ESP32/Arduino via USB.")
-
-    # ── HARDWARE INTEGRATION MODE IN AUTH ENGINE ──────────────────────────
+    # ── How it all works (bottom expander) ──────────────────────────────────
     st.markdown("---")
     with st.expander("🛠️ How Hardware Mode Works"):
         st.markdown("""
-        ### Seamless Simulation → Hardware Switch
+        ### Seamless Simulation ↔ Hardware ↔ BLE Switch
 
         The entire CortexKey processing pipeline (DSP, SVM, passkeys) is **hardware-agnostic**.
-        The only difference when real hardware is connected is where the raw numpy array comes from:
+        The only thing that changes is the data source:
 
         ```
-        SIMULATION MODE:          HARDWARE MODE:
-        ─────────────────         ─────────────────────────────
-        eeg_simulator             BioAmp EXG Pill
-            │                         │
-            ▼                         ▼
-        numpy array              ESP32 ADC samples (12-bit)
-        (microvolts)                  │
-                                      ▼ adc_to_microvolts()
-                                  numpy array
-                                  (microvolts)
-                                  
-        ─────────────────────────────────────────────────────
-        SAME PIPELINE (signal_processing → classifier → auth):
-        
-        numpy array (μV)
-            │
-            ▼ apply_notch_filter(50 Hz)
-            ▼ apply_bandpass_filter(5-30 Hz)
-            ▼ compute_psd (Welch)
-            ▼ extract_band_powers
-            ▼ extract_features (13-dim vector)
-            ▼ SVM classifier
-            ▼ Auth decision
+        SIMULATION:         USB SERIAL:              BLE WIRELESS:
+        ───────────         ────────────             ─────────────────
+        eeg_simulator.py    ESP32 ADC → Serial       ESP32 mock → BLE
+            │                   │                        │
+            ▼                   ▼ adc_to_μV()            ▼ int16 → float
+        numpy array         numpy array              numpy array
+        (microvolts)        (microvolts)             (microvolts)
+            │                   │                        │
+            └──────────── SAME PIPELINE ─────────────────┘
+                    │
+                    ▼ notch filter (50 Hz)
+                    ▼ bandpass (5-30 Hz)
+                    ▼ PSD (Welch)
+                    ▼ feature extraction (13-dim)
+                    ▼ SVM classifier
+                    ▼ Auth decision → Passkey signing
         ```
 
-        When you connect hardware:
-        - **Onboarding** records real trials from the hardware instead of simulating them
-        - **Authentication** captures a live window and classifies it in real time
-        - All visualizations (EEG signal, PSD, band powers) show real data
-        - The passkey flow remains identical
-
-        The `SerialEEGReader` runs in a background thread with a 30-second ring buffer,
-        so the UI never blocks waiting for serial data.
+        When BLE is connected, **Onboarding** and **Authentication** automatically
+        use the wireless EEG stream. The SVM, passkeys, and all visualizations
+        work identically regardless of data source.
         """)
+
+
+def _render_connection_status(stats: dict, transport: str):
+    """Render the 4-column connection status cards (shared by USB & BLE tabs)."""
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>Connection</h3>
+            <div class="value" style="color:#00ff41">🟢 {transport}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>Effective Fs</h3>
+            <div class="value">{stats['effective_fs']:.0f} Hz</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>Buffered</h3>
+            <div class="value">{stats['seconds_buffered']:.1f}s</div>
+        </div>
+        """, unsafe_allow_html=True)
+    with col4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>Samples</h3>
+            <div class="value">{stats['samples_read']:,}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Show BLE-specific info if available
+    if "current_profile" in stats:
+        st.info(f"🧠 Current ESP32 profile: **{stats['current_profile']}** | "
+                f"Device: {stats.get('device_name', 'CortexKey-EEG')}")
+
+
+def _render_live_preview_button(reader_obj, key_suffix: str):
+    """Render the live signal capture & display button (shared by USB & BLE)."""
+    st.markdown("---")
+    st.markdown("### 📡 Live EEG Preview")
+    st.info("👉 The entire app now uses the live EEG stream. "
+            "Go to **Onboarding** or **Authentication** — they will automatically "
+            "use this data source instead of the simulator.")
+
+    if st.button("📊 Capture & Display 4s of Live EEG", use_container_width=True,
+                 key=f"capture_{key_suffix}"):
+        with st.spinner("⏱️ Waiting for 4 seconds of EEG data..."):
+            # BLEEEGReader and SerialEEGReader have the same get_window() API
+            signal = reader_obj.get_window(duration_sec=4.0, wait=True, wait_timeout=12.0)
+
+        if signal is None:
+            st.error("❌ Not enough data in buffer yet. Wait a few seconds and try again.")
+        else:
+            t = reader_obj.get_time_vector(duration_sec=4.0)
+
+            # Run through the same DSP pipeline as simulated data
+            processed = full_preprocessing_pipeline(signal, fs=SAMPLING_RATE)
+            freqs, psd = compute_psd(processed["narrow_bandpass"], fs=SAMPLING_RATE)
+            bp = extract_band_powers(freqs, psd)
+
+            signals_dict = {
+                "raw": signal,
+                "notch_filtered": processed["notch_filtered"],
+                "bandpass_filtered": processed["narrow_bandpass"],
+            }
+
+            fig = create_eeg_signal_plot(t, signals_dict, "Live EEG Signal")
+            st.plotly_chart(fig, use_container_width=True)
+
+            col1, col2 = st.columns(2)
+            with col1:
+                fig_psd = create_psd_plot(freqs, psd, bp, "Live Neural Signature (PSD)")
+                st.plotly_chart(fig_psd, use_container_width=True)
+            with col2:
+                fig_bp = create_band_power_chart(bp, "Band Powers (Live)")
+                st.plotly_chart(fig_bp, use_container_width=True)
+
+            st.success("✅ Signal captured and processed successfully!")
 
 
 # ─────────────────────────────────────────────────────────
@@ -1782,18 +1878,29 @@ def _acquire_eeg(user_id: str, seed: Optional[int] = None):
     """
     Unified EEG acquisition: uses hardware if connected, simulator otherwise.
 
+    Priority: BLE > USB Serial > Simulator.
     Returns (t, raw_signal, meta) — same shape as generate_eeg_signal().
     """
+    # Priority 1: BLE wireless reader
+    ble_reader = st.session_state.get("ble_reader")
+    ble_connected = st.session_state.get("ble_connected", False)
+    if ble_connected and ble_reader is not None and ble_reader.is_connected:
+        signal = ble_reader.get_window(duration_sec=4.0, wait=True, wait_timeout=8.0)
+        if signal is not None:
+            t = ble_reader.get_time_vector(duration_sec=4.0)
+            meta = {"source": "ble", "user_id": user_id,
+                    "profile": ble_reader.current_profile_name}
+            return t, signal, meta
+
+    # Priority 2: USB serial reader
     reader = st.session_state.get("hw_reader")
     hw_connected = st.session_state.get("hw_connected", False)
-
     if hw_connected and reader is not None and reader.is_connected:
         result = acquire_eeg_signal(reader, duration_sec=4.0, wait_timeout=8.0)
         if result is not None:
             t, raw_signal = result
             meta = {"source": "hardware", "user_id": user_id}
             return t, raw_signal, meta
-        # Fall through to simulator on failure
 
     # Fallback: simulator
     return generate_eeg_signal(user_id=user_id, seed=seed)
