@@ -24,7 +24,10 @@ from scipy import signal
 from typing import Dict, Tuple
 
 # numpy ≥ 2.0 renamed np.trapz → np.trapezoid; support both
-_trapz = getattr(np, "trapezoid", None) or np.trapz
+try:
+    _trapz = np.trapezoid  # numpy >= 2.0
+except AttributeError:
+    _trapz = np.trapz      # numpy < 2.0
 
 # EEG frequency bands
 BANDS = {
