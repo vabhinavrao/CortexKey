@@ -12,11 +12,10 @@ build/
 *.egg
 .eggs/
 
-# Streamlit
-.streamlit/
+# Streamlit — keep config.toml but ignore secrets
+.streamlit/secrets.toml
 
-# Data — exclude saved models/keys/passkeys (generated at runtime)
-data/models/*.pkl
+# Data — exclude keys/passkeys (generated at runtime) but KEEP model + templates
 data/keys/
 data/passkeys/credentials.json
 

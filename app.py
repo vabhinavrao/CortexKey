@@ -66,7 +66,7 @@ from cortexkey.ble_reader import (
 
 st.set_page_config(
     page_title="CortexKey — Neural Authentication",
-    page_icon="🧠",
+    page_icon="CortexKey.jpeg",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -208,7 +208,10 @@ def init_session_state():
     if "passkey_manager" not in st.session_state:
         st.session_state.passkey_manager = PasskeyManager()
     if "enrolled_users" not in st.session_state:
-        st.session_state.enrolled_users = set()
+        # Seed from any users already restored from disk by AuthEngine
+        st.session_state.enrolled_users = set(
+            st.session_state.auth_engine.enrolled_users.keys()
+        )
     if "auth_results" not in st.session_state:
         st.session_state.auth_results = []
     if "current_page" not in st.session_state:
@@ -223,6 +226,21 @@ def init_session_state():
         st.session_state.ble_reader = None
     if "ble_connected" not in st.session_state:
         st.session_state.ble_connected = False
+    if "demo_auto_enrolled" not in st.session_state:
+        st.session_state.demo_auto_enrolled = False
+
+    # ── Auto-enroll demo users if classifier is not yet trained ──────────
+    # This runs once per session and makes the app immediately usable on
+    # Streamlit Cloud without any manual onboarding steps.
+    if not st.session_state.demo_auto_enrolled:
+        engine = st.session_state.auth_engine
+        if not engine.classifier.is_trained:
+            result = engine.auto_enroll_demo_users(n_trials=20)
+            st.session_state.enrolled_users = set(engine.enrolled_users.keys())
+        else:
+            # Already trained (restored from disk) — sync the UI set
+            st.session_state.enrolled_users = set(engine.enrolled_users.keys())
+        st.session_state.demo_auto_enrolled = True
 
 init_session_state()
 
@@ -487,8 +505,16 @@ def create_user_comparison_plot(all_probs: dict) -> go.Figure:
 def render_sidebar():
     """Render the sidebar with navigation and system status."""
     with st.sidebar:
+        st.image("CortexKey.jpeg", width=200)
         st.markdown("## 🧠 CortexKey")
         st.markdown("**v0.1** — Neural Authentication MVP")
+
+        # ── Demo-ready banner ────────────────────────────────────────────
+        engine = st.session_state.auth_engine
+        if engine.classifier.is_trained:
+            st.success("✅ **Demo Ready!** All 3 users pre-enrolled.", icon="🧠")
+        else:
+            st.warning("⏳ Initialising demo data…")
 
         st.markdown("---")
 
@@ -756,8 +782,17 @@ def page_authentication():
     engine = st.session_state.auth_engine
 
     if not engine.classifier.is_trained:
-        st.warning("⚠️ No users enrolled! Go to **Onboarding** first to enroll at least 2 users.")
+        st.info("⏳ Demo data is being initialised — please wait a moment and refresh the page.")
         return
+
+    # Ensure enrolled_users set is in sync with the engine (important after auto-enrollment)
+    st.session_state.enrolled_users = set(engine.enrolled_users.keys())
+
+    st.info(
+        "🧠 **Demo mode** — 3 users pre-enrolled with mock EEG data. "
+        "Select a scenario below and click **Authenticate Now**.",
+        icon="ℹ️",
+    )
 
     # Demo scenarios
     st.markdown("### Select Authentication Scenario")
@@ -798,7 +833,10 @@ def page_authentication():
             filtered_scenarios[name] = scenario
 
     if not filtered_scenarios:
-        st.warning("No matching scenarios for enrolled users. Enroll users first.")
+        st.info(
+            "⏳ No matching scenarios yet — demo users are still being enrolled. "
+            "Please wait a moment and try again.",
+        )
         return
 
     selected_scenario = st.selectbox(
@@ -1033,8 +1071,11 @@ def page_passkey_manager():
     pkm = st.session_state.passkey_manager
 
     if not engine.classifier.is_trained:
-        st.warning("⚠️ Enroll users first in **Onboarding** before creating passkeys.")
+        st.info("⏳ Demo data is being initialised — please wait a moment and refresh the page.")
         return
+
+    # Sync enrolled_users with engine
+    st.session_state.enrolled_users = set(engine.enrolled_users.keys())
 
     st.markdown("""
     ### How CortexKey Passkeys Work
@@ -1061,11 +1102,11 @@ def page_passkey_manager():
     col1, col2 = st.columns(2)
 
     with col1:
-        enrolled = list(st.session_state.enrolled_users)
+        enrolled = sorted(st.session_state.enrolled_users)
         if enrolled:
             pk_user = st.selectbox("User", enrolled, key="pk_user")
         else:
-            st.warning("No enrolled users")
+            st.info("⏳ Demo users are still being enrolled — please wait and refresh.")
             return
 
     with col2:
@@ -1153,8 +1194,11 @@ def page_google_demo():
     pkm = st.session_state.passkey_manager
 
     if not engine.classifier.is_trained:
-        st.warning("⚠️ Enroll users first in **Onboarding** before trying Google integration.")
+        st.info("⏳ Demo data is being initialised — please wait a moment and refresh the page.")
         return
+
+    # Sync enrolled_users with engine
+    st.session_state.enrolled_users = set(engine.enrolled_users.keys())
 
     st.markdown("""
     ### Google Passkey Integration Demo
@@ -1179,11 +1223,11 @@ def page_google_demo():
 
         col1, col2 = st.columns(2)
         with col1:
-            enrolled = list(st.session_state.enrolled_users)
+            enrolled = sorted(st.session_state.enrolled_users)
             if enrolled:
                 g_user = st.selectbox("CortexKey User", enrolled, key="g_user")
             else:
-                st.warning("Enroll a user first!")
+                st.info("⏳ Demo users are still being enrolled — please wait and refresh.")
                 return
         with col2:
             gmail = st.text_input("Google Account Email", value=f"{g_user}@gmail.com")
@@ -1838,6 +1882,7 @@ def _render_live_preview_button(reader_obj, key_suffix: str):
                  key=f"capture_{key_suffix}"):
         with st.spinner("⏱️ Waiting for 4 seconds of EEG data..."):
             # BLEEEGReader and SerialEEGReader have the same get_window() API
+
             signal = reader_obj.get_window(duration_sec=4.0, wait=True, wait_timeout=12.0)
 
         if signal is None:

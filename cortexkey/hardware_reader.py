@@ -73,8 +73,12 @@ References:
 """
 
 import numpy as np
-import serial
-import serial.tools.list_ports
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
 import threading
 import queue
 import time
@@ -162,6 +166,8 @@ def list_serial_ports() -> List[Dict[str, str]]:
     -------
     list of dicts with keys: 'port', 'description', 'hwid'
     """
+    if not SERIAL_AVAILABLE:
+        return []
     ports = serial.tools.list_ports.comports()
     result = []
     for p in sorted(ports):
@@ -176,23 +182,11 @@ def list_serial_ports() -> List[Dict[str, str]]:
 def auto_detect_port(board: str = DEFAULT_BOARD) -> Optional[str]:
     """
     Auto-detect the serial port for ESP32 or Arduino.
-
-    Looks for common USB-to-Serial bridge chips:
-    - CP210x (Silicon Labs) — common on ESP32 DevKit boards
-    - CH340 / CH341 — cheap Arduino clones
-    - FTDI FT232 — quality Arduino clones, some ESP32 boards
-    - Prolific PL2303 — generic USB-serial
-
-    Parameters
-    ----------
-    board : str
-        'esp32' or 'arduino' (affects chip priority)
-
-    Returns
-    -------
-    str or None
-        Port name (e.g. '/dev/ttyUSB0', 'COM3') or None if not found
+    Returns None if pyserial is not installed.
     """
+    if not SERIAL_AVAILABLE:
+        return None
+
     # Keywords to search for in port descriptions
     esp32_keywords  = ["CP210", "Silicon Labs", "UART Bridge", "ESP32", "CH340", "CH341"]
     arduino_keywords = ["Arduino", "CH340", "CH341", "FTDI", "FT232", "Prolific", "PL2303"]
@@ -537,28 +531,14 @@ def connect_hardware(
     port: Optional[str] = None,
     board: str = DEFAULT_BOARD,
     baud: int = BAUD_RATE,
-) -> Tuple[bool, str, Optional[SerialEEGReader]]:
+) -> Tuple[bool, str, Optional["SerialEEGReader"]]:
     """
     Connect to the BioAmp EXG Pill hardware.
-
-    Drop-in counterpart to initializing the simulator.
-    Called once from the Streamlit UI when the user clicks "Connect Hardware".
-
-    Parameters
-    ----------
-    port : str, optional
-        Serial port. If None, auto-detect.
-    board : str
-        'esp32' or 'arduino'
-    baud : int
-        Baud rate
-
-    Returns
-    -------
-    success : bool
-    message : str
-    reader : SerialEEGReader or None
+    Returns (False, error_message, None) if pyserial is not installed.
     """
+    if not SERIAL_AVAILABLE:
+        return False, "pyserial not installed — hardware mode unavailable in this environment.", None
+
     global _active_reader
 
     # Stop existing reader

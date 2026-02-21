@@ -45,12 +45,115 @@ class AuthEngine:
     - Passkey credential binding
     """
 
+    # Users that are always pre-enrolled for demo purposes
+    DEMO_USERS = ["devesh", "abhinav", "sadaf"]
+
     def __init__(self, confidence_threshold: float = 0.70):
         _ensure_dirs()
         self.classifier = NeuralClassifier(confidence_threshold=confidence_threshold)
         self.enrolled_users: Dict[str, Dict] = {}
         self.auth_log: List[Dict] = []
         self.model_path = os.path.join(MODELS_DIR, "cortexkey_model.pkl")
+
+        # Attempt to restore previously saved model + templates from disk
+        self._try_restore_from_disk()
+
+    def _try_restore_from_disk(self):
+        """
+        Try to load a previously saved model and template files from disk.
+        This is critical for Streamlit Cloud where session_state resets but
+        the /data directory may still have files from a prior session.
+        """
+        if not os.path.exists(self.model_path):
+            return
+
+        try:
+            self.classifier.load(self.model_path)
+            # Reload templates for each enrolled user the classifier knows about
+            for user_id in self.classifier.enrolled_users:
+                if user_id.startswith("__"):  # skip synthetic impostor class
+                    continue
+                template_path = os.path.join(TEMPLATES_DIR, f"{user_id}_template.npy")
+                if os.path.exists(template_path):
+                    features_matrix = np.load(template_path)
+                    self.enrolled_users[user_id] = {
+                        "features": features_matrix,
+                        "enrolled_at": "restored",
+                        "n_trials": len(features_matrix),
+                    }
+        except Exception:
+            # Corrupt or incompatible model — start fresh
+            self.classifier = NeuralClassifier(
+                confidence_threshold=self.classifier.confidence_threshold
+            )
+            self.enrolled_users = {}
+
+    def auto_enroll_demo_users(self, n_trials: int = 20, progress_callback=None) -> Dict:
+        """
+        Pre-enroll all demo users (devesh, abhinav, sadaf) so the app is
+        immediately usable on Streamlit Cloud without manual onboarding.
+
+        Safe to call even if some users are already enrolled — only enrolls
+        missing users and retrains only when something changed.
+
+        Parameters
+        ----------
+        n_trials : int
+            Number of enrollment trials per user
+        progress_callback : callable, optional
+            Called as (user_index, total_users, user_id) for UI progress
+
+        Returns
+        -------
+        dict
+            Summary of what was enrolled
+        """
+        enrolled_now = []
+        total_users = len(self.DEMO_USERS)
+
+        for idx, user_id in enumerate(self.DEMO_USERS):
+            if user_id in self.enrolled_users:
+                continue  # Already enrolled — skip
+
+            features_list = []
+            for i in range(n_trials):
+                t, raw_signal, meta = generate_eeg_signal(
+                    user_id=user_id,
+                    seed=i * 137 + hash(user_id) % 10000,
+                )
+                processed = full_preprocessing_pipeline(raw_signal, fs=SAMPLING_RATE)
+                feature_vec, _ = extract_features(
+                    processed["narrow_bandpass"], fs=SAMPLING_RATE
+                )
+                features_list.append(feature_vec)
+
+            features_matrix = np.vstack(features_list)
+            self.enrolled_users[user_id] = {
+                "features": features_matrix,
+                "enrolled_at": datetime.now().isoformat(),
+                "n_trials": n_trials,
+            }
+            # Persist template
+            try:
+                template_path = os.path.join(TEMPLATES_DIR, f"{user_id}_template.npy")
+                np.save(template_path, features_matrix)
+            except OSError:
+                pass  # Read-only filesystem (Streamlit Cloud) — in-memory only
+
+            enrolled_now.append(user_id)
+            if progress_callback:
+                progress_callback(idx + 1, total_users, user_id)
+
+        if enrolled_now:
+            # Retrain with all users and persist model
+            self._retrain_classifier()
+
+        return {
+            "newly_enrolled": enrolled_now,
+            "total_enrolled": len(self.enrolled_users),
+            "classifier_trained": self.classifier.is_trained,
+            "cv_accuracy": self.classifier.cv_accuracy,
+        }
 
     def enroll_user(
         self,
@@ -149,8 +252,11 @@ class AuthEngine:
 
         metrics = self.classifier.enroll(features_by_user)
 
-        # Save model
-        self.classifier.save(self.model_path)
+        # Save model — may fail on read-only filesystems (Streamlit Cloud), that's OK
+        try:
+            self.classifier.save(self.model_path)
+        except OSError:
+            pass
 
         return metrics
 
