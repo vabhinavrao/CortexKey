@@ -23,6 +23,9 @@ import numpy as np
 from scipy import signal
 from typing import Dict, Tuple
 
+# numpy ≥ 2.0 renamed np.trapz → np.trapezoid; support both
+_trapz = getattr(np, "trapezoid", None) or np.trapz
+
 # EEG frequency bands
 BANDS = {
     "delta": (0.5, 4),
@@ -180,7 +183,7 @@ def extract_band_powers(
     for band_name, (low, high) in BANDS.items():
         mask = (freqs >= low) & (freqs <= high)
         if np.any(mask):
-            band_powers[band_name] = np.trapz(psd[mask], freqs[mask])
+            band_powers[band_name] = _trapz(psd[mask], freqs[mask])
         else:
             band_powers[band_name] = 0.0
     return band_powers
